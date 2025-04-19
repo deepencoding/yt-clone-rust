@@ -10,7 +10,7 @@ struct Info {
 }
 
 #[post("/process-video")]
-async fn process_video(info: web::Path<Info>) -> impl Responder {
+async fn process_video(info: web::Json<Info>) -> impl Responder {
     let input_file_path = &info.input_file_path;
     let output_file_path = &info.output_file_path;
 
@@ -65,7 +65,7 @@ async fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(default_port);
-    let binding_address = ("127.0.0.1", port);
+    let binding_address = ("0.0.0.0", port);
 
     match HttpServer::new(|| {
         App::new()
