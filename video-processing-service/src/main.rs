@@ -1,47 +1,93 @@
-use std::{env, process::Command};
+use std::env;
 
 use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+use base64::{engine::general_purpose, Engine};
 use serde::Deserialize;
 
+mod storage;
+use storage::GcsClient;
+
+
 #[derive(Deserialize)]
-struct Info {
-    input_file_path: String,
-    output_file_path: String,
+struct MessageData {
+    data: String,
+
+    // #[serde(rename="messageId")]
+    // message_id: String,
 }
 
+#[derive(Deserialize)]
+struct PubSubMessage {
+    message: MessageData,
+}
+
+// #[derive(Deserialize)]
+// struct GcsNotification {
+//     name: String,
+//     bucket: String,
+// }
+
 #[post("/process-video")]
-async fn process_video(info: web::Json<Info>) -> impl Responder {
-    let input_file_path = &info.input_file_path;
-    let output_file_path = &info.output_file_path;
-
-    if input_file_path.is_empty() || output_file_path.is_empty() {
-        if input_file_path.is_empty() { return HttpResponse::BadRequest().body("Bad Request: Missing Input File Path."); }
-        return HttpResponse::BadRequest().body("Bad Request: Missing Output File Path.");
-    }
-
-    let result = Command::new("ffmpeg")
-        .arg("-i")
-        .arg(input_file_path)
-        .arg("-vf")
-        .arg("scale=iw*sar:360:force_original_aspect_ratio=decrease")
-        .arg(output_file_path)
-        .output();
-
-    match result {
-        Ok(output) => {
-            if output.status.success() {
-                HttpResponse::Ok().body("Processing Finished Succesfully.")
-            } else {
-                let error_message = String::from_utf8_lossy(&output.stderr);
-                eprintln!("FFmpeg error: {}", error_message);
-                HttpResponse::InternalServerError().body(format!("Internal Server Error: {}", error_message))
-            }
+async fn process_video(pubsub: web::Json<PubSubMessage>, storage_client: web::Data<GcsClient>) -> impl Responder {
+    let decoded = match general_purpose::STANDARD.decode(&pubsub.message.data) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("Base64 decode error: {}", err);
+            return HttpResponse::BadRequest().body("Bad Request: Invalid base64.");
         }
+    };
+
+    let msg_str = match String::from_utf8(decoded) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("UTF-8 decode error: {}", err);
+            return HttpResponse::BadRequest().body("Bad Request: Invalid UTF-8.");
+        }
+    };
+
+    let payload: serde_json::Value = match serde_json::from_str(&msg_str) {
+        Ok(val) => val,
+        Err(err) => {
+            eprintln!("JSON parse error: {}", err);
+            return HttpResponse::BadRequest().body("Bad Request: Invalid JSON.");
+        }
+    };
+
+    let raw_file_name = match payload.get("name").and_then(|v| v.as_str()) {
+        Some(name) => name,
+        None => return HttpResponse::BadRequest().body("Bad Request: Missing filename."),
+    };
+    let processed_file_name = format!("processed-{}", raw_file_name);
+
+    match storage_client.download_raw_video(raw_file_name).await {
+        Ok(()) => {},
         Err(e) => {
-            eprintln!("Error executing FFmpeg: {}", e);
-            HttpResponse::InternalServerError().body(format!("Internal Server Error: {}", e))
+            eprintln!("Raw video download error: {}", e);
+            return HttpResponse::InternalServerError().body("Failed to download raw video.");
+        },
+    };
+
+    match GcsClient::convert_video(raw_file_name, &processed_file_name) {
+        Ok(()) => {},
+        Err(e) => {
+            eprintln!("Video conversion error: {}", e);
+            GcsClient::delete_local_file(raw_file_name).expect("Failed to delete raw video.");
+            GcsClient::delete_local_file(&processed_file_name).expect("Failed to delete processed video.");
+            return HttpResponse::InternalServerError().body("Failed to convert video.");
         }
     }
+
+    match storage_client.upload_processed_video(&processed_file_name).await {
+        Ok(()) => {},
+        Err(e) => {
+            eprintln!("Processed video Upload error: {}", e);
+            GcsClient::delete_local_file(raw_file_name).expect("Failed to delete raw video.");
+            GcsClient::delete_local_file(&processed_file_name).expect("Failed to delete processed video.");
+            return HttpResponse::InternalServerError().body("Failed to upload processed video.");
+        }
+    };
+    
+    HttpResponse::Ok().body("Processing Complete.")
 }
 
 #[get("/")]
@@ -60,6 +106,8 @@ async fn manual_hello() -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    let storage_client = GcsClient::new();
+
     let default_port: u16 = 3000;
     let port: u16 = env::var("PORT")
         .ok()
@@ -67,10 +115,11 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or(default_port);
     let binding_address = ("0.0.0.0", port);
 
-    match HttpServer::new(|| {
+    match HttpServer::new(move || {
         App::new()
             .service(hello)
             .service(echo)
+            .app_data(web::Data::new(storage_client.clone()))
             .service(process_video)
             .route("/hey", web::get().to(manual_hello))
     })
