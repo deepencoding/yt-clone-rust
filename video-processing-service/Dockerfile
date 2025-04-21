@@ -65,8 +65,6 @@ RUN adduser \
 
 # Copy the executable from the "build" stage.
 COPY --from=build /bin/server /bin/
-# Copy the video file from the build context
-COPY video.mp4 /app/video.mp4
 
 RUN mkdir -p /app && chown -R appuser:appuser /app
 USER appuser
