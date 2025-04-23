@@ -66,6 +66,9 @@ RUN adduser \
 # Copy the executable from the "build" stage.
 COPY --from=build /bin/server /bin/
 
+# Copy the firestore service account file
+COPY firestore-service-acc.json /app/firestore-service-acc.json
+
 RUN mkdir -p /app && chown -R appuser:appuser /app
 USER appuser
 
